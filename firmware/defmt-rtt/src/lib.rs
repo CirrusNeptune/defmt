@@ -44,57 +44,65 @@ use crate::{channel::Channel, consts::BUF_SIZE};
 struct Logger;
 
 /// Global logger lock.
-static TAKEN: AtomicBool = AtomicBool::new(false);
-static mut CS_RESTORE: critical_section::RestoreState = critical_section::RestoreState::invalid();
-static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
+static TAKEN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+//static mut CS_RESTORE: [critical_section::RestoreState; 2] = [critical_section::RestoreState::invalid(), critical_section::RestoreState::invalid()];
+static mut ENCODER: [defmt::Encoder; 2] = [defmt::Encoder::new(), defmt::Encoder::new()];
 
 unsafe impl defmt::Logger for Logger {
     fn acquire() {
+        let core = rp_pac::SIO.cpuid().read() as usize;
+
         // safety: Must be paired with corresponding call to release(), see below
-        let restore = unsafe { critical_section::acquire() };
+        //let restore = unsafe { critical_section::acquire() };
 
         // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        if TAKEN.load(Ordering::Relaxed) {
+        if TAKEN[core].load(Ordering::Relaxed) {
             panic!("defmt logger taken reentrantly")
         }
 
         // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        TAKEN.store(true, Ordering::Relaxed);
+        TAKEN[core].store(true, Ordering::Relaxed);
 
         // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        unsafe { CS_RESTORE = restore };
+        //unsafe { CS_RESTORE[core] = restore };
 
         // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        unsafe { ENCODER.start_frame(do_write) }
+        unsafe { ENCODER[core].start_frame(make_do_write(core)) }
     }
 
     unsafe fn flush() {
+        let core = rp_pac::SIO.cpuid().read() as usize;
+
         // safety: accessing the `&'static _` is OK because we have acquired a critical section.
-        handle().flush();
+        handle(core).flush();
     }
 
     unsafe fn release() {
-        // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        ENCODER.end_frame(do_write);
+        let core = rp_pac::SIO.cpuid().read() as usize;
 
         // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        TAKEN.store(false, Ordering::Relaxed);
+        ENCODER[core].end_frame(make_do_write(core));
 
         // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        let restore = CS_RESTORE;
+        TAKEN[core].store(false, Ordering::Relaxed);
+
+        // safety: accessing the `static mut` is OK because we have acquired a critical section.
+        //let restore = CS_RESTORE[core];
 
         // safety: Must be paired with corresponding call to acquire(), see above
-        critical_section::release(restore);
+        //critical_section::release(restore);
     }
 
     unsafe fn write(bytes: &[u8]) {
+        let core = rp_pac::SIO.cpuid().read() as usize;
+
         // safety: accessing the `static mut` is OK because we have acquired a critical section.
-        ENCODER.write(bytes, do_write);
+        ENCODER[core].write(bytes, make_do_write(core));
     }
 }
 
-fn do_write(bytes: &[u8]) {
-    unsafe { handle().write_all(bytes) }
+fn make_do_write(core: usize) -> impl FnMut(&[u8]) {
+    move |bytes| { unsafe { handle(core).write_all(bytes) } }
 }
 
 #[repr(C)]
@@ -102,7 +110,7 @@ struct Header {
     id: [u8; 16],
     max_up_channels: usize,
     max_down_channels: usize,
-    up_channel: Channel,
+    up_channels: [Channel; 2],
 }
 
 const MODE_MASK: usize = 0b11;
@@ -115,7 +123,7 @@ const MODE_NON_BLOCKING_TRIM: usize = 1;
 /// # Safety
 /// `Channel` API is not re-entrant; this handle should not be held from different execution
 /// contexts (e.g. thread-mode, interrupt context)
-unsafe fn handle() -> &'static Channel {
+unsafe fn handle(core: usize) -> &'static Channel {
     // NOTE the `rtt-target` API is too permissive. It allows writing arbitrary data to any
     // channel (`set_print_channel` + `rprint*`) and that can corrupt defmt log frames.
     // So we declare the RTT control block here and make it impossible to use `rtt-target` together
@@ -123,26 +131,41 @@ unsafe fn handle() -> &'static Channel {
     #[no_mangle]
     static mut _SEGGER_RTT: Header = Header {
         id: *b"SEGGER RTT\0\0\0\0\0\0",
-        max_up_channels: 1,
+        max_up_channels: 2,
         max_down_channels: 0,
-        up_channel: Channel {
-            name: &NAME as *const _ as *const u8,
-            buffer: unsafe { &mut BUFFER as *mut _ as *mut u8 },
-            size: BUF_SIZE,
-            write: AtomicUsize::new(0),
-            read: AtomicUsize::new(0),
-            flags: AtomicUsize::new(MODE_NON_BLOCKING_TRIM),
-        },
+        up_channels: [
+            Channel {
+                name: &NAME0 as *const _ as *const u8,
+                buffer: unsafe { &mut BUFFER0 as *mut _ as *mut u8 },
+                size: BUF_SIZE,
+                write: AtomicUsize::new(0),
+                read: AtomicUsize::new(0),
+                flags: AtomicUsize::new(MODE_NON_BLOCKING_TRIM),
+            },
+            Channel {
+                name: &NAME1 as *const _ as *const u8,
+                buffer: unsafe { &mut BUFFER1 as *mut _ as *mut u8 },
+                size: BUF_SIZE,
+                write: AtomicUsize::new(0),
+                read: AtomicUsize::new(0),
+                flags: AtomicUsize::new(MODE_NON_BLOCKING_TRIM),
+            },
+        ],
     };
 
     #[cfg_attr(target_os = "macos", link_section = ".uninit,defmt-rtt.BUFFER")]
     #[cfg_attr(not(target_os = "macos"), link_section = ".uninit.defmt-rtt.BUFFER")]
-    static mut BUFFER: [u8; BUF_SIZE] = [0; BUF_SIZE];
+    static mut BUFFER0: [u8; BUF_SIZE] = [0; BUF_SIZE];
+    #[cfg_attr(target_os = "macos", link_section = ".uninit,defmt-rtt.BUFFER")]
+    #[cfg_attr(not(target_os = "macos"), link_section = ".uninit.defmt-rtt.BUFFER")]
+    static mut BUFFER1: [u8; BUF_SIZE] = [0; BUF_SIZE];
 
     // Place NAME in data section, so the whole RTT header can be read from RAM.
     // This is useful if flash access gets disabled by the firmware at runtime.
     #[link_section = ".data"]
-    static NAME: [u8; 6] = *b"defmt\0";
+    static NAME0: [u8; 7] = *b"defmt0\0";
+    #[link_section = ".data"]
+    static NAME1: [u8; 7] = *b"defmt1\0";
 
-    &_SEGGER_RTT.up_channel
+    &_SEGGER_RTT.up_channels[core]
 }
